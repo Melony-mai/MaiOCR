@@ -1,0 +1,23 @@
+[project]
+name = "maiocr"
+version = "0.1.0"
+description = "MaiOCR desktop OCR tool"
+requires-python = ">=3.12"
+
+dependencies = [
+    "pyside6",
+    "rapidocr",
+    "onnxruntime",
+    "pillow",
+    "opencv-python",
+    "mss",
+    "pyperclip",
+    "loguru"
+]
+
+[project.scripts]
+maiocr = "maiocr:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
