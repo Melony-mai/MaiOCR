@@ -1,0 +1,53 @@
+[project]
+name = "maiocr"
+version = "0.1.0"
+description = "MaiOCR - offline screenshot OCR tool for Windows desktop"
+requires-python = ">=3.12"
+
+dependencies = [
+    "pyside6",
+    "rapidocr",
+    # Windows: DirectML build runs on any DX12 GPU (NVIDIA/AMD/Intel)
+    # without a CUDA/cuDNN toolkit install. The two builds both provide
+    # the "onnxruntime" module, so exactly one may be installed.
+    "onnxruntime-directml<2; sys_platform == 'win32'",
+    "onnxruntime<2; sys_platform != 'win32'",
+    "pillow",
+    "opencv-python",
+    "mss",
+    "pyperclip",
+    "loguru",
+]
+
+[project.optional-dependencies]
+# Linux dev support only (hotkeys via evdev); not needed on Windows.
+linux = [
+    "pynput>=1.8.2",
+    "evdev>=1.9.3",
+]
+build = [
+    "pyinstaller>=6.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+maiocr = "maiocr.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.ruff.lint]
+# PLE1205/TRY401: loguru uses {}-formatting, not stdlib %s.
+# BLE001/S112: broad excepts are deliberate around GPU/plugin boundaries.
+# DTZ005: history timestamps are local-time by design.
+# RUF007: zip(a, b) over successive pairs of a sorted sequence is the
+#         clearest idiom for neighbour diffs here.
+ignore = ["PLE1205", "PLE1206", "TRY401", "BLE001", "S112", "DTZ005", "RUF007"]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"

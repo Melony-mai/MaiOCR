@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Logs
+logs/
+*.log
+
+# Build
+build/
+dist/
+
+# PyInstaller (keep maiocr.spec under version control)
+*.spec
+!maiocr.spec
+
+# Test artifacts
+screenshot.png
+code_test.png
+pipeline_test.png
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
