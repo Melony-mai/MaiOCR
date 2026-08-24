@@ -63,9 +63,10 @@ def external_models_dir() -> Path:
 def icon_path() -> Path | None:
     """Application icon file, or None when not bundled."""
     candidates = [
+        app_dir() / "resources" / "MaiOCR.ico",
+        app_dir() / "MaiOCR.ico",          # project-root copy (dev tree)
         app_dir() / "resources" / "icon.ico",
-        app_dir() / "icon.ico",          # project-root copy (dev tree)
-        app_dir() / "resources" / "maiocr.ico",
+        app_dir() / "icon.ico",
     ]
     if is_frozen():
         # PyInstaller >= 6 onedir keeps data files inside <exe_dir>/_internal

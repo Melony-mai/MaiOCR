@@ -24,7 +24,11 @@ datas = [
 ]
 # The user-supplied icon lives at the project root; ship it verbatim so the
 # runtime (tray + window icons) uses exactly this file.
-if os.path.exists("icon.ico"):
+if os.path.exists("MaiOCR.ico"):
+    datas.append(("MaiOCR.ico", "resources"))
+elif os.path.exists("resources/MaiOCR.ico"):
+    datas.append(("resources/MaiOCR.ico", "resources"))
+elif os.path.exists("icon.ico"):
     datas.append(("icon.ico", "resources"))
 elif os.path.exists("resources/icon.ico"):
     datas.append(("resources/icon.ico", "resources"))
@@ -87,9 +91,9 @@ exe = EXE(
     upx=False,
     console=False,                       # GUI app: no console window
     icon=(
-        "icon.ico"
-        if os.path.exists("icon.ico")
-        else ("resources/icon.ico" if os.path.exists("resources/icon.ico") else None)
+        "MaiOCR.ico"
+        if os.path.exists("MaiOCR.ico")
+        else ("resources/MaiOCR.ico" if os.path.exists("resources/MaiOCR.ico") else None)
     ),
     version="version_info.txt" if os.path.exists("version_info.txt") else None,
 )
