@@ -64,14 +64,6 @@
 
 ## 🚀 快速开始
 
-### 方式一：下载预构建 EXE（推荐）
-
-从 [Releases](https://github.com/your-repo/MaiOCR/releases) 下载最新的 `MaiOCR.exe`，解压后直接双击运行。
-
-> 便携版：整个 `MaiOCR` 目录可直接拷贝到任意位置或 U 盘使用。
-
-### 方式二：从源码运行（开发/调试）
-
 **前置要求**：
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)（推荐）或 pip
