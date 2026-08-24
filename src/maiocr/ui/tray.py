@@ -55,7 +55,10 @@ class TrayIcon(QSystemTrayIcon):
         on_text=None,
         on_code=None,
         on_show_history=None,
+        on_restart=None,
         on_quit=None,
+        autostart_initial: bool | None = None,
+        on_autostart_toggled=None,
     ):
         super().__init__(_icon())
         self.setToolTip(
@@ -65,6 +68,7 @@ class TrayIcon(QSystemTrayIcon):
             "双击查看历史记录"
         )
 
+        self._autostart_callback = on_autostart_toggled
         self._actions: list[QAction] = []
         menu = QMenu()
 
@@ -75,10 +79,34 @@ class TrayIcon(QSystemTrayIcon):
         menu.addSeparator()
         self.history_action = self._add_action(menu, "历史记录", on_show_history)
         menu.addSeparator()
+        self.autostart_action = QAction("开机自启动", menu)
+        self.autostart_action.setCheckable(True)
+        if autostart_initial is not None:
+            self.autostart_action.setChecked(autostart_initial)
+        if on_autostart_toggled is not None:
+            self.autostart_action.toggled.connect(self._on_autostart_toggled)
+        menu.addAction(self.autostart_action)
+        self._actions.append(self.autostart_action)
+        self.restart_action = self._add_action(menu, "重启 MaiOCR", on_restart)
+        menu.addSeparator()
         self._add_action(menu, "退出", on_quit)
 
         self.setContextMenu(menu)
         self.activated.connect(self._on_activated)
+
+    def _on_autostart_toggled(self, checked: bool):
+        if self._autostart_callback is None:
+            return
+        try:
+            self._autostart_callback(bool(checked))
+        except Exception as e:
+            logger.exception("Setting autostart failed: {}", e)
+            self.autostart_action.blockSignals(True)
+            self.autostart_action.setChecked(not checked)
+            self.autostart_action.blockSignals(False)
+            self.notify(f"开机自启设置失败：{e}", error=True)
+        else:
+            self.notify("已开启开机自启动" if checked else "已关闭开机自启动")
 
     def _add_action(self, menu: QMenu, text: str, callback) -> QAction:
         action = QAction(text, menu)

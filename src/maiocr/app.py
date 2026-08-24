@@ -11,6 +11,7 @@ from maiocr.hotkey.manager import create_hotkey_manager
 from maiocr.ui.result import ResultWindow
 from maiocr.ui.selector import RegionSelector
 from maiocr.ui.tray import TrayIcon
+from maiocr.utils import autostart
 from maiocr.utils.clipboard import copy_text
 from maiocr.utils.logger import get_logger, install_exception_hooks
 from maiocr.utils.paths import icon_path
@@ -155,11 +156,31 @@ def main() -> int:
 
     result_window = ResultWindow()
 
+    restart_state = {"requested": False}
+
+    def _request_restart():
+        logger.info("Restart requested from tray menu")
+        restart_state["requested"] = True
+        app.quit()
+
+    # Runs as the LAST aboutToQuit handler: the single-instance guard is
+    # already released, so the fresh process can acquire it immediately.
+    def _relaunch_if_requested():
+        if not restart_state["requested"]:
+            return
+        try:
+            autostart.spawn_relaunch()
+        except Exception as e:
+            logger.exception("Relaunch failed: {}", e)
+
     tray = TrayIcon(
         on_text=controller.trigger_text,
         on_code=controller.trigger_code,
         on_show_history=result_window.show_history,
+        on_restart=_request_restart,
         on_quit=app.quit,
+        autostart_initial=autostart.is_enabled(),
+        on_autostart_toggled=autostart.set_enabled,
     )
 
     # Copy first (main thread), then render - add_result displays whether
@@ -218,6 +239,7 @@ def main() -> int:
 
     app.aboutToQuit.connect(hotkey.stop)
     app.aboutToQuit.connect(guard.release)
+    app.aboutToQuit.connect(_relaunch_if_requested)
 
     # Start model loading only after every signal is connected, so early
     # failures can never be emitted into the void.

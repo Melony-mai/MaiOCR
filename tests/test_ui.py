@@ -89,6 +89,61 @@ def test_tray_menu_actions(qapp):
     assert not any("区域" in t or "屏幕识别" in t for t in texts)
 
 
+def test_tray_menu_has_autostart_toggle_and_restart(qapp):
+    from maiocr.ui.tray import TrayIcon
+
+    tray = TrayIcon(autostart_initial=False, on_autostart_toggled=lambda v: None)
+    assert tray.autostart_action.isCheckable()
+    assert not tray.autostart_action.isChecked()
+
+    texts = [a.text() for a in tray.contextMenu().actions()]
+    assert any("开机自启" in t for t in texts)
+    assert any("重启" in t for t in texts)
+
+    # Restart sits before Quit; autostart between History and Restart.
+    order = [t for t in texts if t]
+    assert order.index(next(t for t in order if "重启" in t)) < order.index(
+        next(t for t in order if "退出" in t)
+    )
+    assert order.index(next(t for t in order if "历史记录" in t)) < order.index(
+        next(t for t in order if "开机自启" in t)
+    )
+
+
+def test_tray_autostart_initial_state_and_callback(qapp):
+    from maiocr.ui.tray import TrayIcon
+
+    seen = []
+    tray = TrayIcon(on_autostart_toggled=seen.append, autostart_initial=True)
+    assert tray.autostart_action.isChecked()
+
+    tray.autostart_action.setChecked(False)
+    assert seen == [False]
+
+    tray.autostart_action.setChecked(True)
+    assert seen == [False, True]
+
+
+def test_tray_autostart_failure_reverts(qapp):
+    from maiocr.ui.tray import TrayIcon
+
+    def denied(_enabled):
+        raise OSError("access denied")
+
+    tray = TrayIcon(on_autostart_toggled=denied, autostart_initial=False)
+    tray.autostart_action.setChecked(True)
+    assert not tray.autostart_action.isChecked()
+
+
+def test_tray_restart_action(qapp):
+    from maiocr.ui.tray import TrayIcon
+
+    calls = []
+    tray = TrayIcon(on_restart=lambda: calls.append("restart"))
+    tray.restart_action.trigger()
+    assert calls == ["restart"]
+
+
 def _wait_until(qapp, predicate, timeout=5.0):
     """Pump Qt events while waiting (queued signals need event processing)."""
     import time
