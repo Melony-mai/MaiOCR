@@ -57,6 +57,7 @@ class TrayIcon(QSystemTrayIcon):
         on_show_history=None,
         on_restart=None,
         on_quit=None,
+        on_release_vram=None,
         autostart_initial: bool | None = None,
         on_autostart_toggled=None,
     ):
@@ -69,6 +70,7 @@ class TrayIcon(QSystemTrayIcon):
         )
 
         self._autostart_callback = on_autostart_toggled
+        self._release_vram_callback = on_release_vram
         self._actions: list[QAction] = []
         menu = QMenu()
 
@@ -78,6 +80,9 @@ class TrayIcon(QSystemTrayIcon):
         )
         menu.addSeparator()
         self.history_action = self._add_action(menu, "历史记录", on_show_history)
+        menu.addSeparator()
+        self.vram_action = self._add_action(menu, "释放 VRAM", on_release_vram)
+        self.vram_action.setEnabled(False)  # Will be enabled when GPU is available
         menu.addSeparator()
         self.autostart_action = QAction("开机自启动", menu)
         self.autostart_action.setCheckable(True)
@@ -93,6 +98,15 @@ class TrayIcon(QSystemTrayIcon):
 
         self.setContextMenu(menu)
         self.activated.connect(self._on_activated)
+
+    def set_vram_status(self, in_use: bool, status_text: str):
+        """Update VRAM status in the tray menu."""
+        if self.vram_action is not None:
+            self.vram_action.setEnabled(in_use)
+            if in_use:
+                self.vram_action.setText(f"释放 VRAM ({status_text})")
+            else:
+                self.vram_action.setText("释放 VRAM (VRAM 未占用)")
 
     def _on_autostart_toggled(self, checked: bool):
         if self._autostart_callback is None:

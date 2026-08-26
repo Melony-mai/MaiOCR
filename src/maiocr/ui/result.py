@@ -3,6 +3,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -38,7 +39,10 @@ class ResultWindow(QMainWindow):
 
         self.list_widget = QListWidget()
         self.list_widget.setMaximumWidth(230)
+        # Enable multi-selection with standard Windows behavior
+        self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_widget.currentRowChanged.connect(self._on_row_changed)
+        self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
 
         self.text_edit = QPlainTextEdit()
         self.text_edit.setReadOnly(True)
@@ -56,6 +60,11 @@ class ResultWindow(QMainWindow):
         copy_button = QPushButton("复制")
         copy_button.clicked.connect(self.copy_current)
 
+        delete_selected_button = QPushButton("删除选中")
+        delete_selected_button.clicked.connect(self.delete_selected)
+        delete_selected_button.setEnabled(False)
+        self.delete_selected_button = delete_selected_button
+
         clear_button = QPushButton("清空历史")
         clear_button.clicked.connect(self.clear_history)
 
@@ -65,6 +74,7 @@ class ResultWindow(QMainWindow):
         buttons = QHBoxLayout()
         buttons.addStretch()
         buttons.addWidget(copy_button)
+        buttons.addWidget(delete_selected_button)
         buttons.addWidget(clear_button)
         buttons.addWidget(close_button)
 
@@ -78,6 +88,8 @@ class ResultWindow(QMainWindow):
         self.setCentralWidget(central)
 
         QShortcut(QKeySequence(Qt.Key_Escape), self, self.hide)
+        # Delete key to delete selected items
+        QShortcut(QKeySequence(Qt.Key_Delete), self, self.delete_selected)
 
     # ------------------------------------------------------------------ API
 
@@ -121,6 +133,36 @@ class ResultWindow(QMainWindow):
         if copy_text(record.output):
             self.status_label.setText(f"已复制（{len(record.output)} 字符）")
 
+    def delete_selected(self):
+        """Delete all selected history records."""
+        selected_items = self.list_widget.selectedItems()
+        if not selected_items:
+            return
+
+        # Get indices of selected items (in descending order for safe removal)
+        selected_rows = sorted(
+            [self.list_widget.row(item) for item in selected_items],
+            reverse=True,
+        )
+
+        for row in selected_rows:
+            if 0 <= row < len(self._records):
+                del self._records[row]
+                self.list_widget.takeItem(row)
+
+        # Update status
+        if self._records:
+            # Select the item at the first deleted row (or last item if at end)
+            new_row = min(selected_rows[0], len(self._records) - 1)
+            self.list_widget.setCurrentRow(new_row)
+            self._render(self._records[new_row])
+            self.status_label.setText(f"已删除 {len(selected_rows)} 条记录")
+        else:
+            self.text_edit.clear()
+            self.status_label.setText("历史已清空")
+
+        logger.info("Deleted %d selected history records", len(selected_rows))
+
     def clear_history(self):
         self._records.clear()
         self.list_widget.clear()
@@ -139,6 +181,11 @@ class ResultWindow(QMainWindow):
     def _on_row_changed(self, row: int):
         if 0 <= row < len(self._records):
             self._render(self._records[row])
+
+    def _on_selection_changed(self):
+        """Update delete button state based on selection."""
+        has_selection = len(self.list_widget.selectedItems()) > 0
+        self.delete_selected_button.setEnabled(has_selection)
 
     def _render(self, result: PipelineResult):
         self.text_edit.setPlainText(

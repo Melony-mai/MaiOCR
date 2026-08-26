@@ -1,4 +1,5 @@
 import re
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -11,6 +12,9 @@ from maiocr.utils.logger import get_logger
 from maiocr.utils.paths import external_models_dir
 
 logger = get_logger()
+
+# VRAM inactivity timeout in seconds (5 minutes)
+VRAM_INACTIVITY_TIMEOUT = 300
 
 # Kana share of CJK chars above which we re-run with the Japanese model.
 KANA_RATIO_THRESHOLD = 0.12
@@ -314,6 +318,95 @@ def _forbid_downloads():
         df.DownloadFile.run = classmethod(original_run.__func__)
 
 
+class VRAMManager:
+    """
+    Tracks GPU activity and schedules VRAM release.
+
+    The actual engine teardown is delegated to ``release_callback`` (owned
+    by OCREngine) so state flags and reality can never diverge: whenever
+    this manager says "VRAM not in use", the callback has already freed
+    the GPU sessions.
+    """
+
+    def __init__(self, release_callback=None):
+        self._vram_in_use = False
+        self._last_gpu_activity = 0.0
+        self._inactivity_timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+        self._release_callback = release_callback
+
+    def mark_gpu_activity(self):
+        """Call when GPU resources are about to be used (create/infer)."""
+        with self._lock:
+            self._last_gpu_activity = time.time()
+            if not self._vram_in_use:
+                self._vram_in_use = True
+                logger.debug("VRAM marked as in use")
+            self._reset_inactivity_timer()
+
+    def _reset_inactivity_timer(self):
+        if self._inactivity_timer:
+            self._inactivity_timer.cancel()
+        self._inactivity_timer = threading.Timer(
+            VRAM_INACTIVITY_TIMEOUT, self._on_inactivity_timeout
+        )
+        self._inactivity_timer.daemon = True
+        self._inactivity_timer.start()
+
+    def _on_inactivity_timeout(self):
+        with self._lock:
+            idle_long_enough = (
+                time.time() - self._last_gpu_activity >= VRAM_INACTIVITY_TIMEOUT
+            )
+            should_release = idle_long_enough and self._vram_in_use
+        if not should_release:
+            return
+        if self._release_callback is None:
+            logger.warning("VRAM idle timeout but no release callback set")
+            return
+        # Tear down outside the lock. The callback (OCREngine.release_vram)
+        # clears the in-use flag only when it really frees the sessions;
+        # if it refuses (e.g. inference busy), the flag stays True so the
+        # displayed status remains truthful.
+        released = bool(self._release_callback())
+        if released:
+            logger.info(
+                "VRAM auto-released after {} s of GPU inactivity",
+                VRAM_INACTIVITY_TIMEOUT,
+            )
+        else:
+            # Still GPU-resident (busy or transient failure): re-arm so we
+            # retry after another idle period instead of leaking the timer.
+            with self._lock:
+                self._reset_inactivity_timer()
+
+    def force_release_vram(self) -> bool:
+        """Clear the in-use flag; returns True if it was previously set."""
+        with self._lock:
+            if self._inactivity_timer:
+                self._inactivity_timer.cancel()
+                self._inactivity_timer = None
+            was_in_use = self._vram_in_use
+            self._last_gpu_activity = 0.0
+            self._vram_in_use = False
+            if was_in_use:
+                logger.info("VRAM release requested")
+            return was_in_use
+
+    @property
+    def vram_in_use(self) -> bool:
+        with self._lock:
+            return self._vram_in_use
+
+    @property
+    def status_text(self) -> str:
+        """Human-readable VRAM status."""
+        with self._lock:
+            if self._vram_in_use:
+                return "VRAM in use (GPU resident)"
+            return "RAM resident (VRAM not in use)"
+
+
 class OCREngine:
     """
     RapidOCR wrapper.
@@ -322,6 +415,8 @@ class OCREngine:
       back to CPU if GPU init/inference fails.
     - Optional Japanese pass when the result looks kana-heavy and a local
       japan rec model is present.
+    - Manages VRAM: keeps model in RAM, loads to VRAM only during inference,
+      auto-releases after 5 min inactivity.
     """
 
     def __init__(self):
@@ -329,9 +424,16 @@ class OCREngine:
         self._japan_engine = None
         self._japan_model_path: Path | None = find_japan_model()
         self._gpu_failures = 0
+        # Guards engine create/destroy vs. concurrent release requests.
+        self._lifecycle_lock = threading.RLock()
+        # >0 while an inference is using the engines; blocks VRAM release.
+        self._inference_active = 0
 
         self._mode, self._accel_params, self._label = detect_acceleration()
-        self._engine = self._create_engine()
+        # Engine creation is deferred to first inference (lazy): the app
+        # stays RAM-resident at startup and only touches VRAM on demand.
+        self._engine_initialized = False
+        self._vram_manager = VRAMManager(release_callback=self.release_vram)
 
     # ------------------------------------------------------------- creation
 
@@ -384,7 +486,8 @@ class OCREngine:
                 _MAX_GPU_RECOVERIES,
             )
             try:
-                self._engine = self._create_engine()
+                with self._lifecycle_lock:
+                    self._engine = self._create_engine()
                 return
             except Exception as e:
                 logger.warning("GPU engine rebuild failed: {}", e)
@@ -400,7 +503,8 @@ class OCREngine:
         self._accel_params = {}
         self._mode, self._label = "cpu", MODE_CPU
         try:
-            self._engine = self._create_engine()
+            with self._lifecycle_lock:
+                self._engine = self._create_engine()
         except Exception as e:
             logger.error("CPU fallback also failed: {}", e)
             raise
@@ -408,11 +512,31 @@ class OCREngine:
     # ------------------------------------------------------------ inference
 
     def recognize(self, image: Image.Image) -> OcrResult:
-        result = self._run(self._engine, image)
-        self._gpu_failures = 0  # healthy run resets the recovery budget
+        # Mark GPU activity first: VRAM status must be truthful from the
+        # moment resources are allocated (engine create + warmup included).
+        self._vram_manager.mark_gpu_activity()
+        self.ensure_gpu_engines()
+        try:
+            with self._lifecycle_lock:
+                self._inference_active += 1
+            # Lightweight warmup on first use only: compiles GPU kernels
+            # for common shapes. The heavy full-page stress pass and the
+            # alternate-adapter probe are deliberately skipped here - both
+            # add many seconds to the first user screenshot and the rapid
+            # DML session churn can leave the adapter in a bad state.
+            if not getattr(self, "_warmup_done", False):
+                self._warmup_done = True
+                self.warmup(probe_adapters=False)
 
-        if self._looks_japanese(result.text):
-            result = self._maybe_rerun_japanese(image, result)
+            result = self._run(self._engine, image)
+            self._gpu_failures = 0  # healthy run resets the recovery budget
+
+            if self._looks_japanese(result.text):
+                result = self._maybe_rerun_japanese(image, result)
+        finally:
+            with self._lifecycle_lock:
+                self._inference_active -= 1
+            self._vram_manager.mark_gpu_activity()
 
         logger.info(
             "OCR done: {} lines, mean score {:.3f}",
@@ -484,7 +608,84 @@ class OCREngine:
         """Human-readable acceleration mode, e.g. 'GPU/DirectML' or 'CPU'."""
         return self._label
 
-    def warmup(self) -> float | None:
+    # ------------------------------------------------------------ VRAM management
+
+    def release_vram(self) -> bool:
+        """
+        Tear down GPU-resident sessions and return to RAM-resident state.
+
+        Refuses (returns False) while an inference is in flight - freeing
+        sessions under a running call is what wedged/crashed the DML
+        device previously. Also returns False on CPU-only setups or when
+        VRAM is not currently held.
+        """
+        if not self._accel_params:
+            return False
+
+        with self._lifecycle_lock:
+            if self._inference_active > 0:
+                logger.info(
+                    "VRAM release skipped: inference in progress"
+                )
+                return False
+
+            was_in_use = self._vram_manager.force_release_vram()
+            if self._engine is not None or self._japan_engine is not None:
+                self._release_gpu_engines()
+            return was_in_use
+
+    def _release_gpu_engines(self):
+        """Release GPU engine objects so the driver can reclaim VRAM."""
+        try:
+            for name in ("_engine", "_japan_engine"):
+                engine = getattr(self, name, None)
+                if engine is None:
+                    continue
+                # Drop internal ONNX Runtime session references first so
+                # the native memory is freed even if the RapidOCR wrapper
+                # itself lingers in a reference cycle until gc runs.
+                for attr in ("text_det", "text_rec", "text_cls"):
+                    session_obj = getattr(engine, attr, None)
+                    sess = getattr(session_obj, "session", None)
+                    if sess is not None:
+                        try:
+                            sess.__del__()
+                        except Exception as e:
+                            logger.debug(
+                                "Error releasing {} session: {}", attr, e
+                            )
+                setattr(self, name, None)
+
+            import gc
+            gc.collect()
+
+            logger.info("GPU engines released, VRAM freed")
+        except Exception as e:
+            logger.warning("Error releasing GPU engines: {}", e)
+
+    def ensure_gpu_engines(self):
+        """Create the engine on first use, or re-create after a VRAM release."""
+        with self._lifecycle_lock:
+            if not self._engine_initialized or self._engine is None:
+                logger.info("Loading OCR engine into GPU memory on demand")
+                self._engine = self._create_engine()
+                self._engine_initialized = True
+
+    @property
+    def vram_status(self) -> str:
+        """Current VRAM status text for display."""
+        if not self._accel_params:
+            return "CPU 模式 (无 GPU 加速)"
+        return self._vram_manager.status_text
+
+    @property
+    def vram_in_use(self) -> bool:
+        """Whether VRAM is currently allocated for GPU inference."""
+        if not self._accel_params:
+            return False
+        return self._vram_manager.vram_in_use
+
+    def warmup(self, probe_adapters: bool = False) -> float | None:
         """
         Run throwaway inferences so GPU kernels compile and buffers
         allocate before the first real capture.
@@ -492,16 +693,14 @@ class OCREngine:
         DirectML/CUDA compile kernels lazily per input shape; without this
         the first user-facing OCR pays a multi-second compilation cost.
 
-        Doubles as a health check: a tiny-image pass plus one realistic
-        full-page pass catch devices that only handle small shapes well
-        (virtual/software adapters). When suspicious, alternate DirectML
-        adapters are probed once and the fastest verified-DML engine kept.
+        With ``probe_adapters`` (off by default) a full-page stress pass
+        and the alternate-adapter health check run as well; that variant
+        is only meant for explicit startup-style warmups.
 
         Returns elapsed milliseconds of the kept engine, or None on failure.
         """
         start = time.time()
         small_images = _build_warmup_images()
-        stress_image = _build_stress_image()
 
         def measure(engine, imgs) -> float:
             t0 = time.time()
@@ -511,25 +710,33 @@ class OCREngine:
 
         try:
             small_ms = measure(self._engine, small_images)
-            stress_ms = measure(self._engine, [stress_image])
+
+            if probe_adapters:
+                # Full health check: realistic full-page pass plus, on
+                # suspiciously slow adapters, a one-time probe of alternate
+                # DirectML devices. Only safe at startup-style moments;
+                # skipped on the lazy first-use path because the rapid
+                # session churn can destabilise the DML device mid-session
+                # and hang subsequent inferences.
+                stress_image = _build_stress_image()
+                stress_ms = measure(self._engine, [stress_image])
+                if self._mode == "dml" and (
+                    small_ms > _WARMUP_SLOW_MS
+                    or stress_ms > _WARMUP_STRESS_SLOW_MS
+                ):
+                    all_images = [*small_images, stress_image]
+                    self._probe_faster_dml_adapter(
+                        all_images, measure, small_ms, stress_ms
+                    )
         except Exception as e:
             logger.warning("Engine warmup failed (non-fatal): {}", e)
             return None
 
-        if self._mode == "dml" and (
-            small_ms > _WARMUP_SLOW_MS or stress_ms > _WARMUP_STRESS_SLOW_MS
-        ):
-            all_images = [*small_images, stress_image]
-            stress_ms = self._probe_faster_dml_adapter(
-                all_images, measure, small_ms, stress_ms
-            )
-
         total = (time.time() - start) * 1000
         logger.info(
-            "Engine pre-warmed in {:.0f} ms (small {:.0f} / full-page {:.0f}) [{}]",
+            "Engine pre-warmed in {:.0f} ms (small {:.0f}) [{}]",
             total,
             small_ms,
-            stress_ms,
             self._label,
         )
         return total

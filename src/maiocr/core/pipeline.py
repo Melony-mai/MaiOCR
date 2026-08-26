@@ -63,16 +63,28 @@ class MaiOCRPipeline:
     _engine: OCREngine = field(default_factory=OCREngine, repr=False)
 
     def __post_init__(self):
-        # Deliberately blocking: construction runs once on the background
-        # init thread, and app-level readiness only turns true afterwards.
-        # Pre-warming here compiles GPU kernels / allocates buffers so the
-        # first user-triggered OCR skips the multi-second lazy-init cost.
-        self._engine.warmup()
+        # Engine initialization is now deferred to first use to keep VRAM free.
+        # Warmup will run lazily on the first inference.
+        pass
 
     @property
     def acceleration(self) -> str:
         """Human-readable acceleration mode, e.g. 'GPU/DirectML'."""
         return self._engine.mode_label
+
+    @property
+    def vram_status(self) -> str:
+        """Current VRAM status text for display."""
+        return self._engine.vram_status
+
+    @property
+    def vram_in_use(self) -> bool:
+        """Whether VRAM is currently allocated for GPU inference."""
+        return self._engine.vram_in_use
+
+    def release_vram(self) -> bool:
+        """Manually release GPU/VRAM resources. Returns True if VRAM was released."""
+        return self._engine.release_vram()
 
     def run(
         self,

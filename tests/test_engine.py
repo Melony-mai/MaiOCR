@@ -23,6 +23,16 @@ def _bare_engine(mode="dml", label="GPU/DirectML", accel=None):
     eng._gpu_failures = 0
     eng._mode, eng._label = mode, label
     eng._accel_params = dict(accel or {"use_dml": True})
+    eng._engine_initialized = False
+    import threading
+
+    from maiocr.ocr.engine import VRAMManager
+
+    eng._lifecycle_lock = threading.RLock()
+    eng._inference_active = 0
+    eng._warmup_done = True  # keep recovery tests off the real warmup path
+    # Initialize VRAM manager for tests
+    eng._vram_manager = VRAMManager(release_callback=eng.release_vram)
     return eng
 
 
@@ -88,8 +98,76 @@ class TestGpuRecovery:
     def test_healthy_run_resets_recovery_budget(self, monkeypatch):
         eng = _bare_engine()
         eng._engine = self.Flaky(0)
+        eng._engine_initialized = True  # Prevent ensure_gpu_engines from creating real engine
         eng.recognize(type("Img", (), {"convert": lambda self, m: None})())
         assert eng._gpu_failures == 0
+
+
+class _SentinelEngine:
+    """Stand-in for a RapidOCR engine with teardown-safe sessions."""
+
+    def __init__(self):
+        class Sess:
+            def __del__(self):
+                pass
+
+        for attr in ("text_det", "text_rec", "text_cls"):
+            setattr(self, attr, type("Wrapper", (), {"session": Sess()})())
+
+
+class TestVramLifecycle:
+    """Release must be truthful and safe: never under live inference."""
+
+    @pytest.fixture()
+    def eng(self):
+        engine = _bare_engine()
+        engine._engine = _SentinelEngine()
+        engine._engine_initialized = True
+        engine._vram_manager.mark_gpu_activity()  # simulate GPU-resident
+        return engine
+
+    def test_release_destroys_engines_and_updates_status(self, eng):
+        assert eng.vram_in_use
+        assert "GPU resident" in eng.vram_status
+
+        assert eng.release_vram() is True
+
+        assert eng._engine is None
+        assert not eng.vram_in_use
+        assert "RAM resident" in eng.vram_status
+
+    def test_release_refused_while_inference_active(self, eng):
+        with eng._lifecycle_lock:
+            eng._inference_active = 1
+            assert eng.release_vram() is False
+            # Engine untouched - freeing mid-inference would wedge the GPU.
+            assert eng._engine is not None
+            assert eng.vram_in_use
+
+    def test_auto_release_callback_invoked_on_idle_timeout(self, eng):
+        import maiocr.ocr.engine as mod
+
+        manager = mod.VRAMManager(release_callback=eng.release_vram)
+        manager.mark_gpu_activity()
+        # Simulate an expired idle window instead of sleeping 5 minutes.
+        manager._last_gpu_activity -= mod.VRAM_INACTIVITY_TIMEOUT + 1
+        manager._on_inactivity_timeout()
+
+        assert eng._engine is None          # engines really destroyed
+        assert not eng.vram_in_use          # status flag cleared
+
+    def test_auto_release_keeps_flag_when_busy(self, eng):
+        import maiocr.ocr.engine as mod
+
+        eng._inference_active = 1           # release will be refused
+        manager = mod.VRAMManager(release_callback=eng.release_vram)
+        manager.mark_gpu_activity()
+        manager._last_gpu_activity -= mod.VRAM_INACTIVITY_TIMEOUT + 1
+        manager._on_inactivity_timeout()
+
+        assert eng._engine is not None      # not freed mid-inference
+        assert eng.vram_in_use              # status stays truthful
+
 
 _looks_japanese = OCREngine._looks_japanese
 

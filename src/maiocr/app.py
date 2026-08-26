@@ -2,7 +2,7 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import QMetaObject, QObject, Qt, Signal, Slot
+from PySide6.QtCore import QMetaObject, QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -163,6 +163,16 @@ def main() -> int:
         restart_state["requested"] = True
         app.quit()
 
+    def _release_vram():
+        logger.info("Manual VRAM release requested from tray menu")
+        if not controller.ready:
+            tray.notify("OCR 引擎尚未就绪")
+            return
+        if controller._pipeline.release_vram():
+            tray.notify("VRAM 已释放，模型已卸载出显存")
+        else:
+            tray.notify("当前无 VRAM 占用（或识别进行中，请稍后再试）")
+
     # Runs as the LAST aboutToQuit handler: the single-instance guard is
     # already released, so the fresh process can acquire it immediately.
     def _relaunch_if_requested():
@@ -179,6 +189,7 @@ def main() -> int:
         on_show_history=result_window.show_history,
         on_restart=_request_restart,
         on_quit=app.quit,
+        on_release_vram=_release_vram,
         autostart_initial=autostart.is_enabled(),
         on_autostart_toggled=autostart.set_enabled,
     )
@@ -244,6 +255,17 @@ def main() -> int:
     # Start model loading only after every signal is connected, so early
     # failures can never be emitted into the void.
     controller.start()
+
+    # Periodic VRAM status update for tray menu
+    def _update_vram_status():
+        if controller.ready and controller._pipeline:
+            in_use = controller._pipeline.vram_in_use
+            status = controller._pipeline.vram_status
+            tray.set_vram_status(in_use, status)
+
+    vram_timer = QTimer()
+    vram_timer.timeout.connect(_update_vram_status)
+    vram_timer.start(2000)  # Update every 2 seconds
 
     tray.show()
     tray.notify("MaiOCR 已启动，全局快捷键注册后即可框选截图识别")
