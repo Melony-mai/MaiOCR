@@ -110,17 +110,29 @@ def _region_capture_mss(rect: QRect) -> Image.Image | None:
     width = max(1, round(rect.width() * dpr))
     height = max(1, round(rect.height() * dpr))
 
+    # Clamp coordinates to monitor boundaries to prevent out-of-bounds crashes
+    if left < 0:
+        width += left
+        left = 0
+    if top < 0:
+        height += top
+        top = 0
+
+    if width <= 0 or height <= 0:
+        return None
+
     clipped = {
         "left": monitor["left"] + left,
         "top": monitor["top"] + top,
-        "width": min(width, monitor["width"] - left),
-        "height": min(height, monitor["height"] - top),
+        "width": min(width, max(0, monitor["width"] - left)),
+        "height": min(height, max(0, monitor["height"] - top)),
     }
     if clipped["width"] <= 0 or clipped["height"] <= 0:
         logger.error("Region {} outside monitor bounds {}", clipped, monitor)
         return None
 
     return _grab_mss(clipped)
+
 
 
 def _match_monitor(point) -> tuple[dict | None, object, float]:

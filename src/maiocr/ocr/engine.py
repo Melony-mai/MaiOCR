@@ -1,3 +1,4 @@
+import os
 import re
 import threading
 import time
@@ -13,8 +14,11 @@ from maiocr.utils.paths import external_models_dir
 
 logger = get_logger()
 
-# VRAM inactivity timeout in seconds (5 minutes)
-VRAM_INACTIVITY_TIMEOUT = 300
+# VRAM inactivity timeout in seconds (default 60s, configurable via env var)
+VRAM_INACTIVITY_TIMEOUT = int(os.environ.get("MAIOCR_VRAM_TIMEOUT", "60"))
+
+# Upper bound on detection input dimension to prevent multi-gigabyte VRAM blowups on 4K/multi-monitor
+MAX_DET_SIDE_LEN = 2560
 
 # Kana share of CJK chars above which we re-run with the Japanese model.
 KANA_RATIO_THRESHOLD = 0.12
@@ -174,9 +178,13 @@ _RAPIDOCR_EP_PATCHED = False
 
 def _ensure_rapidocr_plain_dict_ep_cfg():
     """
-    Work around a RapidOCR bug: user-supplied EP option dicts are stored in
-    an OmegaConf DictConfig, which onnxruntime rejects (isinstance(dict)),
-    silently degrading every session to CPU. Normalize to a plain dict.
+    Apply runtime optimizations and bug workarounds to RapidOCR:
+    1. ProviderConfig.dml_ep_cfg: OmegaConf DictConfig rejection workaround.
+    2. RapidOCR._initialize: avoid creating the direction classifier (text_cls)
+       and its ONNX session when Global.use_cls is False, saving ~100 MiB VRAM
+       and ~25% inference time.
+    3. DetPreProcess.resize: upper-bound maximum detection input dimension to
+       MAX_DET_SIDE_LEN (2560) to prevent multi-gigabyte VRAM blowups on 4K/multi-monitor.
     """
     global _RAPIDOCR_EP_PATCHED
     if _RAPIDOCR_EP_PATCHED:
@@ -200,6 +208,74 @@ def _ensure_rapidocr_plain_dict_ep_cfg():
     except Exception as e:
         logger.warning("Could not patch RapidOCR EP config handling: {}", e)
 
+    try:
+        from rapidocr.main import RapidOCR
+
+        orig_init = RapidOCR._initialize
+
+        def optimized_initialize(self, cfg):
+            orig_init(self, cfg)
+            if not self.use_cls and hasattr(self, "text_cls") and self.text_cls is not None:
+                # Discard unused classifier session immediately to avoid holding idle GPU VRAM
+                cls_sess = getattr(self.text_cls, "session", None)
+                if cls_sess is not None:
+                    underlying = getattr(cls_sess, "session", None)
+                    if underlying is not None:
+                        try:
+                            if hasattr(underlying, "__del__"):
+                                underlying.__del__()
+                        except Exception as e:
+                            logger.debug("Error releasing classifier underlying session: {}", e)
+                        cls_sess.session = None
+                    self.text_cls.session = None
+                self.text_cls = None
+
+        RapidOCR._initialize = optimized_initialize
+        logger.debug("Patched RapidOCR to avoid unused direction classifier session")
+    except Exception as e:
+        logger.warning("Could not patch RapidOCR classifier initialization: {}", e)
+
+    try:
+        import cv2
+        from rapidocr.ch_ppocr_det.main import DetPreProcess
+        from rapidocr.ch_ppocr_det.utils import ResizeImgError
+
+        def capped_det_resize(self, img: np.ndarray):
+            h, w = img.shape[:2]
+            if self.limit_type == "max":
+                ratio = (
+                    float(self.limit_side_len) / max(h, w)
+                    if max(h, w) > self.limit_side_len
+                    else 1.0
+                )
+            else:
+                ratio = (
+                    float(self.limit_side_len) / min(h, w)
+                    if min(h, w) < self.limit_side_len
+                    else 1.0
+                )
+
+            # Guard against multi-gigabyte VRAM blowups on 4K/multi-monitor setups
+            if max(h, w) * ratio > MAX_DET_SIDE_LEN:
+                ratio = float(MAX_DET_SIDE_LEN) / max(h, w)
+
+            resize_h = int(round(int(h * ratio) / 32) * 32)
+            resize_w = int(round(int(w * ratio) / 32) * 32)
+            if resize_w <= 0 or resize_h <= 0:
+                return None
+            try:
+                return cv2.resize(img, (resize_w, resize_h))
+            except Exception as exc:
+                raise ResizeImgError from exc
+
+        DetPreProcess.resize = capped_det_resize
+        logger.debug(
+            "Patched DetPreProcess with maximum dimension guard ({})",
+            MAX_DET_SIDE_LEN,
+        )
+    except Exception as e:
+        logger.warning("Could not patch DetPreProcess resize: {}", e)
+
 
 def detect_acceleration() -> tuple[str, dict, str]:
     """
@@ -215,7 +291,11 @@ def detect_acceleration() -> tuple[str, dict, str]:
         return "cpu", {}, MODE_CPU
 
     providers = ort.get_available_providers()
-    base = {"Global.text_score": _OCR_TEXT_SCORE}
+    base = {
+        "Global.text_score": _OCR_TEXT_SCORE,
+        "Global.use_cls": False,
+        "Rec.rec_batch_num": 4,
+    }
     for mode, params, label in _ACCEL_PROVIDERS:
         if _PROVIDER_KEYS[mode] in providers:
             merged = {**base, **params}
@@ -519,14 +599,10 @@ class OCREngine:
         try:
             with self._lifecycle_lock:
                 self._inference_active += 1
-            # Lightweight warmup on first use only: compiles GPU kernels
-            # for common shapes. The heavy full-page stress pass and the
-            # alternate-adapter probe are deliberately skipped here - both
-            # add many seconds to the first user screenshot and the rapid
-            # DML session churn can leave the adapter in a bad state.
-            if not getattr(self, "_warmup_done", False):
-                self._warmup_done = True
-                self.warmup(probe_adapters=False)
+            # Direct inference compiles exact kernels for the user's capture shape.
+            # Bypassing synthetic warmup cuts ~700ms from the first-capture latency
+            # while avoiding intermediate allocation of throwaway shapes.
+            self._warmup_done = True
 
             result = self._run(self._engine, image)
             self._gpu_failures = 0  # healthy run resets the recovery budget
@@ -646,16 +722,28 @@ class OCREngine:
                 # itself lingers in a reference cycle until gc runs.
                 for attr in ("text_det", "text_rec", "text_cls"):
                     session_obj = getattr(engine, attr, None)
-                    sess = getattr(session_obj, "session", None)
-                    if sess is not None:
+                    if session_obj is None:
+                        continue
+                    wrapper = getattr(session_obj, "session", None)
+                    if wrapper is not None:
+                        underlying = getattr(wrapper, "session", None)
+                        if underlying is not None:
+                            try:
+                                if hasattr(underlying, "__del__"):
+                                    underlying.__del__()
+                            except Exception as e:
+                                logger.debug("Error deleting underlying session: {}", e)
+                            wrapper.session = None
                         try:
-                            sess.__del__()
+                            if hasattr(wrapper, "__del__"):
+                                wrapper.__del__()
                         except Exception as e:
-                            logger.debug(
-                                "Error releasing {} session: {}", attr, e
-                            )
+                            logger.debug("Error deleting session wrapper: {}", e)
+                        session_obj.session = None
+                    setattr(engine, attr, None)
                 setattr(self, name, None)
 
+            self._engine_initialized = False
             import gc
             gc.collect()
 

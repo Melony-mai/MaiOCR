@@ -299,3 +299,41 @@ class TestOfflineGuard:
         with _forbid_downloads():
             pass
         assert DownloadFile.run.__func__ is before_func
+
+
+class TestOptimizationConfigs:
+    def test_detect_acceleration_defaults(self):
+        from maiocr.ocr.engine import detect_acceleration
+
+        _mode, params, _label = detect_acceleration()
+        assert params.get("Global.use_cls") is False
+        assert params.get("Rec.rec_batch_num") == 4
+        assert params.get("Global.text_score") == 0.25
+
+    def test_det_preprocess_capped_resize(self):
+        import numpy as np
+        from rapidocr.ch_ppocr_det.main import DetPreProcess
+
+        from maiocr.ocr.engine import (
+            MAX_DET_SIDE_LEN,
+            _ensure_rapidocr_plain_dict_ep_cfg,
+        )
+
+        _ensure_rapidocr_plain_dict_ep_cfg()
+        prep = DetPreProcess(736, "min")
+
+        # 4K image (2160, 3840, 3)
+        img_4k = np.zeros((2160, 3840, 3), dtype=np.uint8)
+        resized = prep.resize(img_4k)
+        assert resized is not None
+        h, w = resized.shape[:2]
+        assert max(h, w) <= MAX_DET_SIDE_LEN
+        assert h % 32 == 0 and w % 32 == 0
+
+        # Normal 1080p image (1080, 1920, 3) - unconstrained
+        img_1080p = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        resized_1080p = prep.resize(img_1080p)
+        assert resized_1080p is not None
+        h1, w1 = resized_1080p.shape[:2]
+        assert max(h1, w1) <= MAX_DET_SIDE_LEN
+        assert h1 == 1088 and w1 == 1920  # native rounded to div32

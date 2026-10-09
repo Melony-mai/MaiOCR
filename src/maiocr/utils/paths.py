@@ -42,6 +42,12 @@ def logs_dir() -> Path:
     return path
 
 
+def history_file_path() -> Path:
+    """Path to the persistent history JSON file."""
+    return app_data_dir() / "history.json"
+
+
+
 def external_models_dir() -> Path:
     """
     Optional user-supplied model directory.

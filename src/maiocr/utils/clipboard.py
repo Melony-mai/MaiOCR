@@ -36,11 +36,20 @@ def _copy_pyperclip(text: str) -> bool:
     """
     import os
 
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    saved_stdout, saved_stderr = os.dup(1), os.dup(2)
+    saved_stdout = None
+    saved_stderr = None
+    devnull = None
     try:
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            saved_stdout = os.dup(1)
+            saved_stderr = os.dup(2)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+        except OSError:
+            # Running headless/windowed without stdout/stderr file descriptors
+            pass
+
         import pyperclip
 
         pyperclip.copy(text)
@@ -49,11 +58,24 @@ def _copy_pyperclip(text: str) -> bool:
         logger.warning("pyperclip failed: {}", e)
         return False
     finally:
-        os.dup2(saved_stdout, 1)
-        os.dup2(saved_stderr, 2)
-        os.close(saved_stdout)
-        os.close(saved_stderr)
-        os.close(devnull)
+        if saved_stdout is not None:
+            try:
+                os.dup2(saved_stdout, 1)
+                os.close(saved_stdout)
+            except OSError:
+                pass
+        if saved_stderr is not None:
+            try:
+                os.dup2(saved_stderr, 2)
+                os.close(saved_stderr)
+            except OSError:
+                pass
+        if devnull is not None:
+            try:
+                os.close(devnull)
+            except OSError:
+                pass
+
 
 
 def copy_text(text: str) -> bool:

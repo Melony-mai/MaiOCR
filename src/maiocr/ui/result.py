@@ -1,4 +1,8 @@
+import json
+import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
@@ -19,6 +23,7 @@ from PySide6.QtWidgets import (
 from maiocr.core.pipeline import PipelineResult
 from maiocr.utils.clipboard import copy_text
 from maiocr.utils.logger import get_logger
+from maiocr.utils.paths import history_file_path
 
 logger = get_logger()
 
@@ -26,14 +31,23 @@ MAX_HISTORY = 100
 
 
 class ResultWindow(QMainWindow):
-    """OCR result viewer with in-session history."""
+    """OCR result viewer with persistent history."""
 
-    def __init__(self):
+    def __init__(self, history_file: Path | None = None):
         super().__init__()
 
         self.setWindowTitle("MaiOCR 识别结果")
         self.resize(720, 480)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        if history_file is not None:
+            self._history_file = Path(history_file)
+        elif "MAIOCR_HISTORY_FILE" in os.environ:
+            self._history_file = Path(os.environ["MAIOCR_HISTORY_FILE"])
+        elif "PYTEST_CURRENT_TEST" in os.environ:
+            self._history_file = None
+        else:
+            self._history_file = history_file_path()
 
         self._records: list[PipelineResult] = []
 
@@ -91,6 +105,8 @@ class ResultWindow(QMainWindow):
         # Delete key to delete selected items
         QShortcut(QKeySequence(Qt.Key_Delete), self, self.delete_selected)
 
+        self._load_saved_history()
+
     # ------------------------------------------------------------------ API
 
     def add_result(self, result: PipelineResult):
@@ -111,9 +127,11 @@ class ResultWindow(QMainWindow):
             self.list_widget.takeItem(self.list_widget.count() - 1)
 
         self.list_widget.blockSignals(True)
+        self.list_widget.clearSelection()
         self.list_widget.setCurrentRow(0)
         self.list_widget.blockSignals(False)
         self._render(result)
+        self._save_history()
 
         self.show()
         self.raise_()
@@ -151,9 +169,10 @@ class ResultWindow(QMainWindow):
                 self.list_widget.takeItem(row)
 
         # Update status
+        self.list_widget.clearSelection()
         if self._records:
-            # Select the item at the first deleted row (or last item if at end)
-            new_row = min(selected_rows[0], len(self._records) - 1)
+            # Select the item at the lowest deleted row (or last item if at end)
+            new_row = min(selected_rows[-1], len(self._records) - 1)
             self.list_widget.setCurrentRow(new_row)
             self._render(self._records[new_row])
             self.status_label.setText(f"已删除 {len(selected_rows)} 条记录")
@@ -161,20 +180,108 @@ class ResultWindow(QMainWindow):
             self.text_edit.clear()
             self.status_label.setText("历史已清空")
 
-        logger.info("Deleted %d selected history records", len(selected_rows))
+        self._save_history()
+        logger.info("Deleted {} selected history records", len(selected_rows))
 
     def clear_history(self):
         self._records.clear()
         self.list_widget.clear()
         self.text_edit.clear()
         self.status_label.setText("历史已清空")
+        self._save_history()
         logger.info("History cleared")
 
     # ------------------------------------------------------------- internals
 
+    def _load_saved_history(self):
+        """Load persistent history from disk on startup."""
+        if self._history_file is None or not self._history_file.is_file():
+            return
+        try:
+            content = self._history_file.read_text(encoding="utf-8")
+            if not content.strip():
+                return
+            data = json.loads(content)
+            if not isinstance(data, list):
+                logger.warning("History file is not a list: {}", self._history_file)
+                return
+
+            records: list[PipelineResult] = []
+            for item in data[:MAX_HISTORY]:
+                if isinstance(item, dict):
+                    try:
+                        records.append(PipelineResult.from_dict(item))
+                    except Exception as e:
+                        logger.warning("Failed to deserialize history record: {}", e)
+
+            self._records = records
+            self.list_widget.blockSignals(True)
+            self.list_widget.clear()
+            for rec in records:
+                self.list_widget.addItem(QListWidgetItem(self._item_label(rec)))
+            if records:
+                self.list_widget.setCurrentRow(0)
+                self._render(records[0])
+            self.list_widget.blockSignals(False)
+            logger.info(
+                "Loaded {} history records from {}", len(records), self._history_file
+            )
+        except Exception as e:
+            logger.warning("Failed to load history from {}: {}", self._history_file, e)
+            try:
+                corrupt_backup = self._history_file.with_name(
+                    f"history.json.corrupt.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                )
+                self._history_file.rename(corrupt_backup)
+                logger.warning("Backed up corrupted history file to {}", corrupt_backup)
+            except Exception as backup_err:
+                logger.warning(
+                    "Failed to backup corrupted history file: {}", backup_err
+                )
+
+
+    def _save_history(self):
+        """Persist current history records atomically to disk."""
+        if self._history_file is None:
+            return
+        try:
+            self._history_file.parent.mkdir(parents=True, exist_ok=True)
+            data = [rec.to_dict() for rec in self._records[:MAX_HISTORY]]
+
+            tmp_fd, tmp_path_str = tempfile.mkstemp(
+                dir=str(self._history_file.parent),
+                prefix="history_",
+                suffix=".tmp",
+                text=True,
+            )
+            tmp_path = Path(tmp_path_str)
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_path, self._history_file)
+            logger.debug(
+                "Saved {} history records to {}", len(data), self._history_file
+            )
+        except Exception as e:
+            logger.error("Failed to save history to {}: {}", self._history_file, e)
+
     @staticmethod
     def _item_label(result: PipelineResult) -> str:
-        stamp = datetime.now().strftime("%H:%M:%S")
+        stamp = ""
+        if result.created_at:
+            try:
+                dt = datetime.fromisoformat(result.created_at)
+                now = datetime.now()
+                if dt.date() == now.date():
+                    stamp = dt.strftime("%H:%M:%S")
+                else:
+                    stamp = dt.strftime("%m-%d %H:%M")
+            except Exception:
+                stamp = result.created_at[:8]
+        if not stamp:
+            stamp = datetime.now().strftime("%H:%M:%S")
         kind = f"代码·{result.language}" if result.is_code else "文字"
         return f"{stamp}  {kind}  {len(result.output)}字"
 
@@ -204,3 +311,4 @@ class ResultWindow(QMainWindow):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
+

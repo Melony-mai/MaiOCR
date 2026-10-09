@@ -41,9 +41,14 @@ class SingleInstance:
             return False
 
         # Accept (and drop) connections from duplicate launches.
-        self._server.newConnection.connect(
-            lambda: self._server.nextPendingConnection().disconnectFromServer()
-        )
+        def _on_new_connection():
+            if self._server is not None:
+                client = self._server.nextPendingConnection()
+                if client is not None:
+                    client.disconnectFromServer()
+                    client.deleteLater()
+
+        self._server.newConnection.connect(_on_new_connection)
         logger.info("Single-instance lock acquired")
         return True
 

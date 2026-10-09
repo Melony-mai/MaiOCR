@@ -1,5 +1,6 @@
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 
 from PIL import Image
@@ -29,6 +30,9 @@ class PipelineResult:
     ocr_ms: float = 0.0
     total_ms: float = 0.0
     structure: dict | None = None   # code-mode structural summary
+    created_at: str = field(
+        default_factory=lambda: datetime.now().isoformat(timespec="seconds")
+    )
 
     @property
     def summary(self) -> str:
@@ -48,6 +52,44 @@ class PipelineResult:
                 base += " · " + "/".join(bits)
             return base
         return "文字识别"
+
+    def to_dict(self) -> dict:
+        return {
+            "mode": self.mode.value if isinstance(self.mode, Mode) else str(self.mode),
+            "raw_text": self.raw_text,
+            "output": self.output,
+            "language": self.language,
+            "is_code": self.is_code,
+            "copied": self.copied,
+            "capture_ms": self.capture_ms,
+            "ocr_ms": self.ocr_ms,
+            "total_ms": self.total_ms,
+            "structure": self.structure,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PipelineResult":
+        mode_val = data.get("mode", "text")
+        try:
+            mode = Mode(mode_val)
+        except ValueError:
+            mode = Mode.TEXT
+        return cls(
+            mode=mode,
+            raw_text=data.get("raw_text", ""),
+            output=data.get("output", ""),
+            language=data.get("language", ""),
+            is_code=bool(data.get("is_code", False)),
+            copied=bool(data.get("copied", False)),
+            capture_ms=float(data.get("capture_ms", 0.0)),
+            ocr_ms=float(data.get("ocr_ms", 0.0)),
+            total_ms=float(data.get("total_ms", 0.0)),
+            structure=data.get("structure"),
+            created_at=data.get("created_at")
+            or datetime.now().isoformat(timespec="seconds"),
+        )
+
 
 
 @dataclass
